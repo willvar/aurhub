@@ -2,80 +2,34 @@
 
 AUR 宕机时的备用 RPC 镜像，数据源来自 GitHub [archlinux/aur](https://github.com/archlinux/aur)。
 
-纯 Go，零 CGO，零运行时依赖。
+compile-then-serve 架构：C++23，mmap 快照 + 两级位图搜索 + `SO_REUSEPORT` epoll 服务。
 
-## 安装
+## 构建
 
 ```bash
-go install github.com/willvar/aurhub@latest
+cmake -S . -B build -G Ninja
+cmake --build build
 ```
 
-或者克隆后本地编译：
+要求：C++23 编译器、CMake 4.0+、Ninja、zlib、CLI11、simdjson。
+
+## 使用
 
 ```bash
-git clone https://github.com/willvar/aurhub.git
-cd aurhub
-go build -o aurhub .
-```
+# 1. 下载 AUR 镜像并构建快照（URL 自动 clone，已存在自动 fetch）
+aurhub-indexer \
+  --repo https://github.com/archlinux/aur.git \
+  --output ./aurhub.snapshot \
+  --jobs "$(nproc)"
 
-## 用法
+# 2. 启动服务
+aurhubd --snapshot ./aurhub.snapshot --port 9090 --workers "$(nproc)"
 
-```bash
-aurhub serve -a :9090    # 启动（首次自动克隆+建索引，之后每30分钟增量同步）
-aurhub status            # 查看运行状态
-aurhub stop              # 停止
-aurhub restart           # 重启
-```
-
-启动后 yay 切到本地：
-
-```bash
+# 3. yay 切到本地
 yay --aururl http://localhost:9090 --save
 ```
 
-切回官方：
-
-```bash
-yay --aururl https://aur.archlinux.org --save
-```
-
-## 架构
-
-```
-archlinux/aur (GitHub)         内存索引                HTTP RPC
-┌─────────────────┐   go-srcinfo  ┌───────────┐  JSON   ┌──────────┐
-│  158k 个分支     │ ────────────▶ │ 170k 条目  │ ◀───── │  /rpc    │
-│ .SRCINFO        │              │ 首字母索引  │        │ /packages│
-└─────────────────┘              └───────────┘        └──────────┘
-      ▲                              │                      │
-  git fetch                      gob 序列化           yay --aururl
-  增量同步                       aurhub.gob           localhost:9090
-```
-
-- **数据源**：`git clone --bare` GitHub 镜像，增量 `git fetch`
-- **解析**：[go-srcinfo](https://github.com/Jguer/go-srcinfo)（yay 作者维护）
-- **索引**：内存 `[]dbEntry` + `map[string]int` + 首字母预过滤数组
-- **持久化**：`encoding/gob` 二进制，76MB
-- **搜索**：首字母预过滤 → `strings.Contains` 线性扫描
-- **RPC**：`net/http`，v5 协议，`/rpc` + `/packages.gz` + `/health`
-
-## 性能
-
-| 指标 | 数据 |
-|---|---|
-| 全量 sync | 35s |
-| 增量 sync | 6s |
-| 顺序搜索 | 261 QPS |
-| 顺序 info | 254 QPS |
-| 并发 p99 | <2ms |
-| 磁盘占用 | 76MB |
-| 内存占用 | ~200MB |
-
-## 局限
-
-- 无维护者/投票/热度等元数据（GitHub 镜像不含）
-- 无 RPC v6（yay 未适配）
-- 搜索结果上限 500 条
+**定时更新**：用 cron 或 systemd timer 定时跑第 1 步，indexer 覆盖 `./aurhub.snapshot`，`aurhubd` 通过 inotify 检测变化并热重载，零停机。
 
 ## License
 
