@@ -1,0 +1,16 @@
+[Unit]
+Description=aurhub RPC mirror server
+After=network.target
+Wants=aurhub-indexer.timer
+
+[Service]
+Type=simple
+StateDirectory=aurhub
+WorkingDirectory=%S/aurhub
+ExecStartPre=aurhub-indexer --repo https://github.com/archlinux/aur.git --output %S/aurhub/aurhub.snapshot
+ExecStart=aurhubd --snapshot %S/aurhub/aurhub.snapshot --port 9090
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+Also=aurhub-indexer.timer

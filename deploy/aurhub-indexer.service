@@ -1,0 +1,8 @@
+[Unit]
+Description=aurhub snapshot indexer
+
+[Service]
+Type=oneshot
+StateDirectory=aurhub
+WorkingDirectory=%S/aurhub
+ExecStart=aurhub-indexer --repo https://github.com/archlinux/aur.git --output %S/aurhub/aurhub.snapshot
