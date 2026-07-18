@@ -1,5 +1,7 @@
 # aurhub
 
+[中文](README.md)
+
 An offline RPC mirror for the AUR, backed by the [archlinux/aur](https://github.com/archlinux/aur) GitHub repository.
 
 C++23 compile-then-serve architecture: mmap snapshot, two-level bitmap search, `SO_REUSEPORT` epoll server.

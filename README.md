@@ -1,5 +1,7 @@
 # aurhub
 
+[English](README.en.md)
+
 AUR 宕机时的备用 RPC 镜像，数据源来自 GitHub [archlinux/aur](https://github.com/archlinux/aur)。
 
 C++23 compile-then-serve 架构：mmap 快照 + 两级位图搜索 + `SO_REUSEPORT` epoll 服务。
