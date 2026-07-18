@@ -1473,7 +1473,7 @@ int main(int argc, char** argv) {
         } else {
             if (std::system(("git --git-dir=" + local + " fetch " +
                              options.repo +
-                             " +refs/heads/*:refs/heads/* --prune")
+                             " +refs/heads/*:refs/heads/*")
                                 .c_str()) != 0) {
                 std::cerr << "aurhub-indexer: git fetch failed\n";
                 return 1;

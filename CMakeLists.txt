@@ -8,9 +8,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
+set(_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
 find_package(ZLIB REQUIRED)
+set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_suffixes})
 find_package(CLI11 REQUIRED)
-find_package(simdjson REQUIRED)
+
+include(FetchContent)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    simdjson
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG v4.6.4
+    GIT_SHALLOW TRUE
+)
+set(SIMDJSON_DEVELOPER_MODE OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(simdjson)
 
 add_library(aurhub_core
     src/generation.cpp
@@ -20,6 +33,7 @@ add_library(aurhub_core
 )
 target_include_directories(aurhub_core PUBLIC src)
 target_link_libraries(aurhub_core PUBLIC ZLIB::ZLIB simdjson::simdjson)
+target_link_options(aurhub_core PUBLIC -static)
 target_compile_options(aurhub_core PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 )
