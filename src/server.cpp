@@ -29,6 +29,8 @@
 #include <sys/inotify.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -51,6 +53,8 @@ using SnapshotPtr = std::shared_ptr<const aurhub::GenerationView>;
 
 struct Options {
     std::string snapshot;
+    std::string mirror;
+    std::string git_root;
     std::string address = "127.0.0.1";
     std::uint16_t port = 8080;
     std::size_t workers =
@@ -208,6 +212,125 @@ private:
 
 void stop_server(int /*signum*/) {
     g_running = 0;
+}
+
+std::string git_repos_dir(const Options& options) {
+    if (!options.git_root.empty()) {
+        return options.git_root;
+    }
+    if (options.mirror.empty()) {
+        return {};
+    }
+    return (std::filesystem::path(options.mirror).parent_path() / "repos").string();
+}
+
+bool run_command(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) { argv.push_back(const_cast<char*>(a.c_str())); }
+    argv.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) { execvp(argv[0], argv.data()); _exit(127); }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+std::string run_git_output(const std::vector<std::string>& args,
+                           std::string_view stdin_data = {}) {
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    if (!stdin_data.empty() && pipe(in_pipe) != 0) return {};
+    if (pipe(out_pipe) != 0) {
+        if (in_pipe[0] != -1) { close(in_pipe[0]); close(in_pipe[1]); }
+        return {};
+    }
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) { argv.push_back(const_cast<char*>(a.c_str())); }
+    argv.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (in_pipe[0] != -1) { close(in_pipe[0]); close(in_pipe[1]); }
+        close(out_pipe[0]); close(out_pipe[1]);
+        return {};
+    }
+    if (pid == 0) {
+        if (!stdin_data.empty()) { dup2(in_pipe[0], STDIN_FILENO); }
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(out_pipe[0]); close(out_pipe[1]);
+        if (in_pipe[0] != -1) { close(in_pipe[0]); close(in_pipe[1]); }
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    if (in_pipe[0] != -1) { close(in_pipe[0]); }
+    close(out_pipe[1]);
+    if (!stdin_data.empty()) {
+        size_t off = 0;
+        while (off < stdin_data.size()) {
+            ssize_t w = write(in_pipe[1], stdin_data.data() + off, stdin_data.size() - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0) break;
+            off += static_cast<size_t>(w);
+        }
+        close(in_pipe[1]);
+    }
+    std::string out;
+    char buf[8192];
+    while (true) {
+        ssize_t r = read(out_pipe[0], buf, sizeof(buf));
+        if (r > 0) out.append(buf, static_cast<size_t>(r));
+        else if (r == 0) break;
+        else if (errno == EINTR) continue;
+        else break;
+    }
+    close(out_pipe[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return {};
+    return out;
+}
+
+std::string ensure_git_repo(std::string_view pkgbase, const Options& options) {
+    std::string repos = git_repos_dir(options);
+    if (repos.empty() || options.mirror.empty()) return {};
+    // validate pkgbase characters to avoid path traversal
+    if (pkgbase.empty() || pkgbase.find('/') != std::string_view::npos ||
+        pkgbase.find('.') != std::string_view::npos) {
+        return {};
+    }
+    std::string repo = repos + "/" + std::string(pkgbase) + ".git";
+    if (std::filesystem::exists(repo + "/objects")) {
+        return repo;
+    }
+    // verify branch exists in mirror
+    if (!run_command({"git", "--git-dir=" + options.mirror, "rev-parse", "--verify",
+                      "refs/heads/" + std::string(pkgbase)})) {
+        return {};
+    }
+    std::filesystem::create_directories(repos);
+    if (!run_command({"git", "init", "--bare", "-q", repo})) return {};
+    std::string alt = repo + "/objects/info/alternates";
+    std::filesystem::create_directories(std::filesystem::path(alt).parent_path());
+    {
+        std::string obj = options.mirror + "/objects\n";
+        int fd = open(alt.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return {};
+        write(fd, obj.c_str(), obj.size());
+        close(fd);
+    }
+    if (!run_command({"git", "--git-dir=" + repo, "fetch", "-q", options.mirror,
+                      "refs/heads/" + std::string(pkgbase) + ":refs/heads/master"})) {
+        std::filesystem::remove_all(repo);
+        return {};
+    }
+    run_command({"git", "--git-dir=" + repo, "symbolic-ref", "HEAD", "refs/heads/master"});
+    return repo;
 }
 
 int hex_value(char ch) {
@@ -403,11 +526,78 @@ PreparedResponse closed_response(int status,
 }
 
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-PreparedResponse route_request(const SnapshotPtr& snapshot,
+PreparedResponse handle_git(const Options& options,
                                std::string_view method,
                                std::string_view target,
+                               std::string_view body,
+                               ClientConnection connection) {
+    // target like /jre-jetbrains.git/info/refs?service=git-upload-pack
+    // or /jre-jetbrains.git/git-upload-pack
+    std::string_view path = target;
+    std::string_view query;
+    if (auto q = target.find('?'); q != std::string_view::npos) {
+        path = target.substr(0, q);
+        query = target.substr(q + 1);
+    }
+    // extract pkgbase: /<pkgbase>.git/...
+    if (!path.starts_with("/") || (!path.ends_with(".git") && path.find(".git/") == std::string_view::npos)) {
+        // check for /<name>.git/info/refs or /<name>.git/git-upload-pack
+        if (path.find(".git/") == std::string_view::npos) {
+            return owned_response(404, "Not Found", "text/plain", "not found\n", connection);
+        }
+    }
+    // find .git suffix
+    size_t git_pos = path.find(".git");
+    if (git_pos == std::string_view::npos || git_pos == 1) {
+        return owned_response(404, "Not Found", "text/plain", "not found\n", connection);
+    }
+    std::string_view pkgbase = path.substr(1, git_pos - 1);
+    std::string_view suffix = path.substr(git_pos + 4); // after .git
+    std::string repo = ensure_git_repo(pkgbase, options);
+    if (repo.empty()) {
+        return owned_response(404, "Not Found", "text/plain", "not found\n", connection);
+    }
+    if (method == "GET" && suffix == "/info/refs") {
+        auto params = parse_query(query);
+        if (query_value(params, "service") != "git-upload-pack") {
+            return owned_response(404, "Not Found", "text/plain", "not found\n", connection);
+        }
+        std::string out = run_git_output({"git", "upload-pack", "--stateless-rpc", "--advertise-refs", repo});
+        if (out.empty() && !std::filesystem::exists(repo + "/HEAD")) {
+            return owned_response(500, "Internal Server Error", "text/plain", "git error\n", connection);
+        }
+        std::string body_out = "001e# service=git-upload-pack\n0000" + out;
+        std::string hdr = http_header(200, "OK", "application/x-git-upload-pack-advertisement", body_out.size(), connection);
+        PreparedResponse resp;
+        resp.bytes = hdr + body_out;
+        resp.close_after = connection == ClientConnection::close;
+        return resp;
+    }
+    if (method == "POST" && suffix == "/git-upload-pack") {
+        std::string out = run_git_output({"git", "upload-pack", "--stateless-rpc", repo}, body);
+        if (out.empty()) {
+            // git upload-pack may return empty on error, check repo exists
+        }
+        std::string hdr = http_header(200, "OK", "application/x-git-upload-pack-result", out.size(), connection);
+        PreparedResponse resp;
+        resp.bytes = hdr + out;
+        resp.close_after = connection == ClientConnection::close;
+        return resp;
+    }
+    return owned_response(404, "Not Found", "text/plain", "not found\n", connection);
+}
+
+PreparedResponse route_request(const Options& options,
+                               const SnapshotPtr& snapshot,
+                               std::string_view method,
+                               std::string_view target,
+                               std::string_view body,
                                ClientConnection connection) {
     // NOLINTEND(bugprone-easily-swappable-parameters)
+    // git handling before method check (needs POST)
+    if (target.find(".git") != std::string_view::npos) {
+        return handle_git(options, method, target, body, connection);
+    }
     if (method == "OPTIONS") {
         return owned_response(204, "No Content", "text/plain", {}, connection);
     }
@@ -424,10 +614,10 @@ PreparedResponse route_request(const SnapshotPtr& snapshot,
             : parse_query(target.substr(question + 1));
 
     if (path == "/health") {
-        const std::string body =
+        const std::string health_body =
             "ok\npackages: " + std::to_string(snapshot->package_count()) +
             "\ncreated_at: " + std::to_string(snapshot->created_at()) + "\n";
-        return owned_response(200, "OK", "text/plain", body,
+        return owned_response(200, "OK", "text/plain", health_body,
                               connection);
     }
     if (path == "/packages.gz") {
@@ -496,7 +686,8 @@ PreparedResponse route_request(const SnapshotPtr& snapshot,
                           rpc_error("unknown rpc type"), connection);
 }
 
-PreparedResponse parse_http_request(const SnapshotPtr& snapshot,
+PreparedResponse parse_http_request(const Options& options,
+                                    const SnapshotPtr& snapshot,
                                     std::string_view request) {
     const std::size_t header_end = request.find("\r\n\r\n");
     const std::size_t line_end = request.find("\r\n");
@@ -579,11 +770,24 @@ PreparedResponse parse_http_request(const SnapshotPtr& snapshot,
             connection = ClientConnection::explicit_keep_alive;
         }
     }
-    if (transfer_encoding || content_length != 0) {
+    bool is_git = target.find(".git") != std::string_view::npos;
+    if (transfer_encoding) {
         return closed_response(400, "Bad Request",
                                "request bodies are not supported\n");
     }
-    return route_request(snapshot, method, target, connection);
+    if (content_length != 0 && !(is_git && method == "POST" && target.find("git-upload-pack") != std::string_view::npos)) {
+        return closed_response(400, "Bad Request",
+                               "request bodies are not supported\n");
+    }
+    // body is after \r\n\r\n
+    std::string_view body;
+    if (content_length != 0) {
+        if (request.size() < header_end + 4 + static_cast<std::size_t>(content_length)) {
+            return closed_response(400, "Bad Request", "incomplete body\n");
+        }
+        body = request.substr(header_end + 4, static_cast<std::size_t>(content_length));
+    }
+    return route_request(options, snapshot, method, target, body, connection);
 }
 
 void install_response(Connection& connection, PreparedResponse response) {
@@ -621,6 +825,7 @@ void compact_input(Connection& connection) {
 }
 
 bool prepare_next_response(Connection& connection,
+                           const Options& options,
                            const SnapshotPtr& snapshot) {
     if (connection.has_response()) {
         return true;
@@ -641,8 +846,8 @@ bool prepare_next_response(Connection& connection,
         return false;
     }
 
-    const std::size_t request_size = header_end + 4;
-    if (request_size > kMaxHeaderBytes) {
+    const std::size_t header_size = header_end + 4;
+    if (header_size > kMaxHeaderBytes) {
         install_response(
             connection,
             closed_response(431, "Request Header Fields Too Large",
@@ -651,10 +856,45 @@ bool prepare_next_response(Connection& connection,
         connection.input_offset = 0;
         return true;
     }
+    // for git POST, need body too
+    std::size_t content_length = 0;
+    {
+        // quick extract Content-Length for sizing
+        std::string_view headers = input.substr(0, header_end);
+        std::string lower;
+        lower.reserve(headers.size());
+        for (char c : headers) lower.push_back(ascii_lower(c));
+        std::string_view low = lower;
+        size_t pos = low.find("content-length:");
+        if (pos != std::string_view::npos) {
+            size_t start = pos + 15;
+            while (start < low.size() && (low[start]==' '||low[start]=='\t')) ++start;
+            size_t end = start;
+            while (end < low.size() && low[end]>='0' && low[end]<='9') ++end;
+            if (start < end) {
+                auto r = std::from_chars(low.data()+start, low.data()+end, content_length);
+                if (r.ec != std::errc{}) content_length = 0;
+            }
+        }
+    }
+    const std::size_t total_needed = header_size + content_length;
+    if (input.size() < total_needed) {
+        // need more data for body
+        if (total_needed > kMaxBufferedInputBytes) {
+            install_response(
+                connection,
+                closed_response(431, "Request Header Fields Too Large",
+                                "too much pipelined input\n"));
+            connection.input.clear();
+            connection.input_offset = 0;
+            return true;
+        }
+        return false;
+    }
 
     PreparedResponse response =
-        parse_http_request(snapshot, input.substr(0, request_size));
-    connection.input_offset += request_size;
+        parse_http_request(options, snapshot, input.substr(0, total_needed));
+    connection.input_offset += total_needed;
     compact_input(connection);
     install_response(connection, std::move(response));
     return true;
@@ -769,6 +1009,7 @@ bool read_requests(int fd, Connection& connection) {
 
 bool drive_output(int fd,
                   Connection& connection,
+                  const Options& options,
                   const SnapshotPtr& active_snapshot) {
     std::size_t completed = 0;
     while (connection.has_response()) {
@@ -825,7 +1066,7 @@ bool drive_output(int fd,
         if (close_after) {
             return false;
         }
-        if (!prepare_next_response(connection, active_snapshot)) {
+        if (!prepare_next_response(connection, options, active_snapshot)) {
             return !connection.peer_read_closed;
         }
         if (completed >= kMaxResponsesPerDispatch) {
@@ -896,7 +1137,8 @@ void drain_eventfd(int fd) {
 }
 
 void serve_worker(int listener,
-                  const std::atomic<SnapshotPtr>& snapshots) {
+                  const std::atomic<SnapshotPtr>& snapshots,
+                  const Options& options) {
     const int epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
         ::close(listener);
@@ -967,10 +1209,10 @@ void serve_worker(int listener,
                 keep = read_requests(fd, connection);
             }
             if (keep && !connection.has_response()) {
-                prepare_next_response(connection, active_snapshot);
+                prepare_next_response(connection, options, active_snapshot);
             }
             if (keep && connection.has_response()) {
-                keep = drive_output(fd, connection, active_snapshot);
+                keep = drive_output(fd, connection, options, active_snapshot);
             }
             if (keep && connection.peer_read_closed &&
                 !connection.has_response()) {
@@ -1030,9 +1272,9 @@ void serve(const Options& options,
     try {
         for (std::size_t i = 0; i < listeners.size(); ++i) {
             const int listener = listeners[i];
-            workers.emplace_back([&snapshots, listener, i] {
+            workers.emplace_back([&snapshots, &options, listener, i] {
                 try {
-                    serve_worker(listener, snapshots);
+                    serve_worker(listener, snapshots, options);
                 } catch (const std::exception& error) {
                     std::cerr << "aurhubd: worker " << i << ": "
                               << error.what() << '\n';
@@ -1126,6 +1368,8 @@ int main(int argc, char** argv) {
         CLI::App app{"AUR RPC mirror server"};
         app.add_option("--snapshot", options.snapshot,
                        "Snapshot file")->required();
+        app.add_option("--mirror", options.mirror, "Bare mirror path for git clone");
+        app.add_option("--git-root", options.git_root, "Per-pkgbase git repos dir");
         app.add_option("--address", options.address, "Listen IPv4 address");
         app.add_option("--port", options.port, "Listen port")
             ->check(CLI::Range(1, 65535));
