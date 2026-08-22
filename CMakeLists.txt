@@ -26,7 +26,11 @@ set(SIMDJSON_DEVELOPER_MODE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(simdjson)
 
 add_library(aurhub_core
+    src/connection.cpp
     src/generation.cpp
+    src/git.cpp
+    src/http.cpp
+    src/merge.cpp
     src/search.cpp
     src/snapshot.cpp
     src/srcinfo.cpp
