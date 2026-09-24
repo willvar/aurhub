@@ -133,7 +133,8 @@ grep -q 'query="definitely-not-present" matches=0' \
     exit 1
 }
 
-"${SERVER}" --snapshot "${TMP}/aurhub.snapshot" --port "${PORT}" --workers 2 \
+"${SERVER}" --snapshot "${TMP}/aurhub.snapshot" --mirror "${TMP}/repo.git" \
+    --git-root "${TMP}/served-repos" --port "${PORT}" --workers 2 \
     >"${TMP}/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -152,6 +153,27 @@ if [[ ${READY} -ne 1 ]]; then
 fi
 
 grep -q 'packages: 4' "${TMP}/health"
+
+ALPHA_URL="http://127.0.0.1:${PORT}/pkg-alpha.git"
+BETA_URL="http://127.0.0.1:${PORT}/pkg-beta.git"
+ALPHA_COMMIT=$(git --git-dir="${TMP}/repo.git" rev-parse refs/heads/pkg-alpha)
+[[ $(git ls-remote "${ALPHA_URL}" HEAD | cut -f1) == "${ALPHA_COMMIT}" ]]
+git clone -q "${ALPHA_URL}" "${TMP}/client-alpha"
+grep -q 'pkgver = 2.0' "${TMP}/client-alpha/.SRCINFO"
+
+# Concurrent first requests for a package must initialize only one usable repository.
+PIDS=()
+for i in $(seq 1 8); do
+    git ls-remote "${BETA_URL}" HEAD >"${TMP}/beta-ref-${i}" &
+    PIDS+=("$!")
+done
+for pid in "${PIDS[@]}"; do
+    wait "${pid}"
+done
+BETA_COMMIT=$(git --git-dir="${TMP}/repo.git" rev-parse refs/heads/pkg-beta)
+for i in $(seq 1 8); do
+    [[ $(cut -f1 "${TMP}/beta-ref-${i}") == "${BETA_COMMIT}" ]]
+done
 
 curl -fsS --globoff \
     "http://127.0.0.1:${PORT}/rpc?v=5&type=search&arg=tools" \
@@ -224,6 +246,10 @@ if [[ ${HOT_RELOADED} -ne 1 ]]; then
     cat "${TMP}/server.log" >&2
     exit 1
 fi
+ALPHA_COMMIT=$(git --git-dir="${TMP}/repo.git" rev-parse refs/heads/pkg-alpha)
+[[ $(git ls-remote "${ALPHA_URL}" HEAD | cut -f1) == "${ALPHA_COMMIT}" ]]
+git -C "${TMP}/client-alpha" fetch -q origin
+git -C "${TMP}/client-alpha" show FETCH_HEAD:.SRCINFO | grep -q 'pkgver = 3.0'
 
 cp "${TMP}/aurhub.snapshot" "${TMP}/aurhub.snapshot.valid"
 printf 'not a snapshot\n' >"${TMP}/aurhub.snapshot.bad"
@@ -276,7 +302,8 @@ git --git-dir="${TMP}/repo.git" update-ref -d refs/heads/pkg-duplicate-z
     >"${TMP}/fallback.log" 2>&1
 grep -q 'deleted=1' "${TMP}/fallback.log"
 
-"${SERVER}" --snapshot "${TMP}/aurhub.snapshot" --port "${PORT}" --workers 2 \
+"${SERVER}" --snapshot "${TMP}/aurhub.snapshot" --mirror "${TMP}/repo.git" \
+    --git-root "${TMP}/served-repos" --port "${PORT}" --workers 2 \
     >"${TMP}/fallback-server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
@@ -289,11 +316,15 @@ for _ in $(seq 1 50); do
 done
 grep -q '"Version":"1.0-1"' "${TMP}/shared-fallback.json"
 grep -q 'Duplicate fallback branch' "${TMP}/shared-fallback.json"
+[[ $(curl -sS -o /dev/null -w '%{http_code}' \
+    "${BETA_URL}/info/refs?service=git-upload-pack") == 200 ]]
+git --git-dir="${TMP}/repo.git" update-ref -d refs/heads/pkg-beta
+[[ $(curl -sS -o /dev/null -w '%{http_code}' \
+    "${BETA_URL}/info/refs?service=git-upload-pack") == 404 ]]
 kill "${SERVER_PID}"
 wait "${SERVER_PID}"
 SERVER_PID=
 
-git --git-dir="${TMP}/repo.git" update-ref -d refs/heads/pkg-beta
 "${INDEXER}" --repo "${TMP}/repo.git" --output "${TMP}/aurhub.snapshot" \
     --max-overlay-records 0 >"${TMP}/delete.log" 2>&1
 grep -q 'deleted=1' "${TMP}/delete.log"

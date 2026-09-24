@@ -25,13 +25,15 @@ aurhub-indexer \
   --jobs "$(nproc)"
 
 # 2. Start the server
-aurhubd --snapshot ./aurhub.snapshot --port 9090 --workers "$(nproc)"
+aurhubd --snapshot ./aurhub.snapshot --mirror "$(pwd)/aur.git" --port 9090 --workers "$(nproc)"
 
 # 3. Point yay at the local mirror
 yay --aururl http://localhost:9090 --save
 ```
 
 For scheduled updates, use the provided systemd timer (see [`deploy/`](deploy/)). The indexer overwrites the snapshot and `aurhubd` hot-reloads via inotify with zero downtime.
+
+With `--mirror` configured, Git clones use on-demand per-package repositories that share the mirror's objects. Requests update only the package's branch ref instead of repeatedly fetching from the mirror.
 
 ## Deployment
 

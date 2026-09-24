@@ -1,12 +1,15 @@
 #include "http.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <simdjson.h>
 #include <span>
@@ -100,42 +103,68 @@ std::string run_git_output(const std::vector<std::string>& args,
     return out;
 }
 
+std::string git_commit(const std::string& repo, const std::string& ref) {
+    std::string commit = run_git_output({"git", "--git-dir=" + repo,
+                                         "rev-parse", "--verify", "-q",
+                                         ref + "^{commit}"});
+    if (!commit.empty() && commit.back() == '\n') {
+        commit.pop_back();
+    }
+    return commit;
+}
+
 std::string ensure_git_repo(std::string_view pkgbase, const Options& options) {
-    std::string repos = git_repos_dir(options);
-    if (repos.empty() || options.mirror.empty()) return {};
-    // validate pkgbase characters to avoid path traversal
-    if (pkgbase.empty() || pkgbase.find('/') != std::string_view::npos ||
-        pkgbase.find('.') != std::string_view::npos) {
+    const std::string repos = git_repos_dir(options);
+    if (repos.empty() || options.mirror.empty()) {
         return {};
     }
-    std::string repo = repos + "/" + std::string(pkgbase) + ".git";
+    // validate pkgbase characters to avoid path traversal
+    if (pkgbase.empty() || pkgbase.contains('/') || pkgbase.contains('.')) {
+        return {};
+    }
+    static std::array<std::mutex, 64> repo_mutexes;
+    const std::lock_guard<std::mutex> lock(
+        repo_mutexes[std::hash<std::string_view>{}(pkgbase) % repo_mutexes.size()]);
+
+    const std::string branch = "refs/heads/" + std::string(pkgbase);
+    const std::string commit = git_commit(options.mirror, branch);
+    if (commit.empty()) {
+        return {};
+    }
+
+    const std::string repo = repos + "/" + std::string(pkgbase) + ".git";
     if (std::filesystem::exists(repo + "/objects")) {
-        run_command({"git", "--git-dir=" + repo, "fetch", "-q", options.mirror,
-                     "refs/heads/" + std::string(pkgbase) + ":refs/heads/master"});
+        if (git_commit(repo, "refs/heads/master") != commit &&
+            !run_command({"git", "--git-dir=" + repo, "update-ref",
+                          "refs/heads/master", commit})) {
+            return {};
+        }
         return repo;
     }
-    // verify branch exists in mirror
-    if (!run_command({"git", "--git-dir=" + options.mirror, "rev-parse", "--verify",
-                      "refs/heads/" + std::string(pkgbase)})) {
+    std::filesystem::create_directories(repos);
+    if (!run_command({"git", "init", "--bare", "-q", repo})) {
         return {};
     }
-    std::filesystem::create_directories(repos);
-    if (!run_command({"git", "init", "--bare", "-q", repo})) return {};
-    std::string alt = repo + "/objects/info/alternates";
+    const std::string alt = repo + "/objects/info/alternates";
     std::filesystem::create_directories(std::filesystem::path(alt).parent_path());
     {
-        std::string obj = options.mirror + "/objects\n";
-        int fd = open(alt.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) return {};
-        write(fd, obj.c_str(), obj.size());
+        const std::string obj = options.mirror + "/objects\n";
+        const int fd = open(alt.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write(fd, obj.c_str(), obj.size()) !=
+                          static_cast<ssize_t>(obj.size())) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            std::filesystem::remove_all(repo);
+            return {};
+        }
         close(fd);
     }
-    if (!run_command({"git", "--git-dir=" + repo, "fetch", "-q", options.mirror,
-                      "refs/heads/" + std::string(pkgbase) + ":refs/heads/master"})) {
+    if (!run_command({"git", "--git-dir=" + repo, "update-ref", "refs/heads/master", commit}) ||
+        !run_command({"git", "--git-dir=" + repo, "symbolic-ref", "HEAD", "refs/heads/master"})) {
         std::filesystem::remove_all(repo);
         return {};
     }
-    run_command({"git", "--git-dir=" + repo, "symbolic-ref", "HEAD", "refs/heads/master"});
     return repo;
 }
 

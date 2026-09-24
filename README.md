@@ -25,13 +25,15 @@ aurhub-indexer \
   --jobs "$(nproc)"
 
 # 2. 启动服务
-aurhubd --snapshot ./aurhub.snapshot --port 9090 --workers "$(nproc)"
+aurhubd --snapshot ./aurhub.snapshot --mirror "$(pwd)/aur.git" --port 9090 --workers "$(nproc)"
 
 # 3. 将 yay 指向本地
 yay --aururl http://localhost:9090 --save
 ```
 
 定时更新：用 systemd timer 定时跑 indexer，覆盖快照文件，`aurhubd` 通过 inotify 检测变化并热重载，零停机。安装方式见 [`deploy/`](deploy/)。
+
+配置 `--mirror` 后，Git 克隆使用按需建立的单包仓库，共用镜像中的对象；请求时只同步对应分支的引用，不会重复 fetch 整个镜像。
 
 ## 部署
 
